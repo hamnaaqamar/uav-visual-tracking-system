@@ -1,0 +1,8 @@
+# CPU and CUDA PyTorch installations are platform-specific; Ultralytics installs
+# a compatible default build. Install the appropriate PyTorch wheel first when
+# CUDA is required: https://pytorch.org/get-started/locally/
+ultralytics>=8.3,<9
+deep-sort-realtime>=1.3.2,<2
+opencv-python>=4.10,<6
+PyYAML>=6.0,<7
+numpy>=1.26,<3

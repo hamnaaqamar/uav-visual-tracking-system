@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uav-tracking-baseline"
+version = "0.1.0"
+description = "Measured UAVDT YOLO and DeepSORT baseline"
+requires-python = ">=3.10"
+dependencies = [
+  "ultralytics>=8.3,<9",
+  "deep-sort-realtime>=1.3.2,<2",
+  "opencv-python>=4.10,<6",
+  "PyYAML>=6.0,<7",
+  "numpy>=1.26,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9", "ruff>=0.13,<1"]
+
+[project.scripts]
+uav-track = "uav_tracking.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

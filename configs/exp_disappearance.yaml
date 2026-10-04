@@ -1,0 +1,38 @@
+dataset:
+  root: data/UAVDT
+  sequence: M0101
+  start_frame: 1
+  end_frame: null
+
+detector:
+  model: yolo11n.pt
+  confidence_threshold: 0.25
+  iou_threshold: 0.45
+  image_size: 640
+  classes:
+    - car
+    - truck
+    - bus
+
+tracker:
+  max_age: 30
+  n_init: 3
+  max_cosine_distance: 0.2
+  embedder: mobilenet
+  embedder_gpu: false
+  half: false
+
+output:
+  directory: outputs/baseline
+  save_video: true
+  video_fps: 30.0
+  save_sample_frames: 3
+
+runtime:
+  device: cpu
+  log_level: INFO
+
+experiment:
+  # Inclusive range. Set both values to simulate a detector outage.
+  suppress_detections_start: 100
+  suppress_detections_end: 200

@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+*.egg-info/
+
+# Models, datasets, and generated experiments are not source artifacts.
+*.pt
+*.onnx
+data/*
+!data/README.md
+outputs/*
+!outputs/.gitkeep
+experiments/*
+!experiments/README.md
