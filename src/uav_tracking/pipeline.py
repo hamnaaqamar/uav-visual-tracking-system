@@ -15,6 +15,7 @@ from uav_tracking.config import AppConfig
 from uav_tracking.data.uavdt import UAVDTSequence
 from uav_tracking.detection.yolo import YoloDetector
 from uav_tracking.evaluation.metrics import DetectionMetrics, TrackingMetrics
+from uav_tracking.profiling import StageProfiler
 from uav_tracking.tracking.deep_sort import DeepSortTracker
 from uav_tracking.visualization.drawing import draw_tracks
 
@@ -22,8 +23,16 @@ LOGGER = logging.getLogger(__name__)
 
 
 class TrackingPipeline:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        profile: bool = False,
+        warmup_frames: int = 30,
+    ) -> None:
         self.config = config
+        self.profile = profile
+        self.warmup_frames = warmup_frames
 
     def run(self) -> dict[str, Any]:
         import cv2
@@ -34,6 +43,11 @@ class TrackingPipeline:
             self.config.dataset.start_frame,
             self.config.dataset.end_frame,
         )
+        if self.profile and not 0 <= self.warmup_frames < len(sequence):
+            raise ValueError(
+                "Profiling warm-up must be non-negative and smaller than the "
+                f"{len(sequence)} selected frames"
+            )
         detector = YoloDetector(self.config.detector, self.config.runtime.device)
         tracker = DeepSortTracker(self.config.tracker)
         output = self.config.output.directory
@@ -51,6 +65,9 @@ class TrackingPipeline:
         end_outage_ids: set[int] | None = None
         first_post_outage: dict[str, Any] | None = None
         video_writer = None
+        profiler = StageProfiler(self.warmup_frames) if self.profile else None
+        processed = 0
+        processing_started = 0.0
 
         with (
             (output / "detections.csv").open("w", newline="", encoding="utf-8") as detection_file,
@@ -79,15 +96,51 @@ class TrackingPipeline:
                 ]
             )
 
-            for processed, frame in enumerate(sequence, start=1):
+            frames = iter(sequence)
+            processing_started = time.perf_counter()
+            while True:
+                end_to_end_started = time.perf_counter()
+                read_started = end_to_end_started
+                try:
+                    frame = next(frames)
+                except StopIteration:
+                    break
+                processed += 1
+                if profiler is not None:
+                    profiler.record(
+                        processed, "read_decode", _elapsed_ms(read_started)
+                    )
+
                 started = time.perf_counter()
+                _cuda_synchronize(self.profile)
                 detection_started = time.perf_counter()
-                detections = detector.detect(frame.image)
-                detector_ms.append((time.perf_counter() - detection_started) * 1000.0)
+                if profiler is not None:
+                    detections, detector_profile = detector.detect_profiled(frame.image)
+                else:
+                    detections = detector.detect(frame.image)
+                    detector_profile = None
+                _cuda_synchronize(self.profile)
+                detector_elapsed = _elapsed_ms(detection_started)
+                detector_ms.append(detector_elapsed)
+                if profiler is not None and detector_profile is not None:
+                    profiler.record(processed, "detector_total", detector_elapsed)
+                    profiler.record(
+                        processed, "detector_preprocess", detector_profile.preprocess
+                    )
+                    profiler.record(
+                        processed, "yolo_inference", detector_profile.inference
+                    )
+                    profiler.record(
+                        processed,
+                        "detection_postprocess",
+                        detector_profile.postprocess,
+                    )
                 suppressed = self.config.experiment.suppresses(frame.frame_index)
                 if suppressed:
                     detections = []
                 confidences.extend(detection.confidence for detection in detections)
+
+                csv_started = time.perf_counter()
                 for detection in detections:
                     detection_log.writerow(
                         [
@@ -98,12 +151,27 @@ class TrackingPipeline:
                             suppressed,
                         ]
                     )
-                detection_metrics.update(frame.ground_truth, detections)
+                csv_elapsed = _elapsed_ms(csv_started)
 
+                metrics_started = time.perf_counter()
+                detection_metrics.update(frame.ground_truth, detections)
+                metrics_elapsed = _elapsed_ms(metrics_started)
+
+                _cuda_synchronize(self.profile)
                 tracking_started = time.perf_counter()
                 tracks = tracker.update(detections, frame.image)
-                tracker_ms.append((time.perf_counter() - tracking_started) * 1000.0)
+                _cuda_synchronize(self.profile)
+                tracker_elapsed = _elapsed_ms(tracking_started)
+                tracker_ms.append(tracker_elapsed)
+                if profiler is not None:
+                    profiler.record(processed, "tracker", tracker_elapsed)
+
+                metrics_started = time.perf_counter()
                 tracking_metrics.update(frame.ground_truth, tracks)
+                metrics_elapsed += _elapsed_ms(metrics_started)
+                if profiler is not None:
+                    profiler.record(processed, "metrics", metrics_elapsed)
+
                 current_ids = {track.track_id for track in tracks}
                 confirmed_ids = {track.track_id for track in tracks if track.confirmed}
                 suppression_start = self.config.experiment.suppress_detections_start
@@ -125,6 +193,8 @@ class TrackingPipeline:
                 for deleted_id in sorted(active_ids.difference(current_ids)):
                     deletion_events.append({"frame": frame.frame_index, "track_id": deleted_id})
                 active_ids = current_ids
+
+                csv_started = time.perf_counter()
                 for track in tracks:
                     track_log.writerow(
                         [
@@ -140,11 +210,22 @@ class TrackingPipeline:
                             track.time_since_update,
                         ]
                     )
+                csv_elapsed += _elapsed_ms(csv_started)
+                if profiler is not None:
+                    profiler.record(processed, "csv_writing", csv_elapsed)
 
-                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                elapsed_ms = _elapsed_ms(started)
                 pipeline_ms.append(elapsed_ms)
+                if profiler is not None:
+                    profiler.record(processed, "pipeline", elapsed_ms)
                 instantaneous_fps = 1000.0 / elapsed_ms if elapsed_ms else None
+
+                render_started = time.perf_counter()
                 rendered = draw_tracks(frame.image, tracks, frame.frame_index, instantaneous_fps)
+                if profiler is not None:
+                    profiler.record(processed, "rendering", _elapsed_ms(render_started))
+
+                encode_started = time.perf_counter()
                 if self.config.output.save_video:
                     if video_writer is None:
                         height, width = rendered.shape[:2]
@@ -157,13 +238,27 @@ class TrackingPipeline:
                         if not video_writer.isOpened():
                             raise RuntimeError("Could not initialize MP4 output writer")
                     video_writer.write(rendered)
+                if profiler is not None:
+                    profiler.record(
+                        processed, "video_encoding_writing", _elapsed_ms(encode_started)
+                    )
+
+                sample_started = time.perf_counter()
                 if processed <= self.config.output.save_sample_frames:
                     cv2.imwrite(str(output / f"sample_{frame.frame_index:06d}.jpg"), rendered)
+                if profiler is not None:
+                    profiler.record(
+                        processed, "sample_image_writing", _elapsed_ms(sample_started)
+                    )
+                    profiler.record(
+                        processed, "end_to_end", _elapsed_ms(end_to_end_started)
+                    )
                 if processed % 100 == 0:
                     LOGGER.info("Processed %d/%d frames", processed, len(sequence))
 
         if video_writer is not None:
             video_writer.release()
+        wall_clock_seconds = time.perf_counter() - processing_started
         summary = {
             "status": "completed",
             "sequence": sequence.sequence,
@@ -207,10 +302,34 @@ class TrackingPipeline:
                 ),
             },
         }
+        if profiler is not None:
+            profile_report = profiler.report(
+                frames_processed=processed,
+                wall_clock_seconds=wall_clock_seconds,
+            )
+            summary["profiling"] = profile_report
+            with (output / "profiling.json").open("w", encoding="utf-8") as handle:
+                json.dump(profile_report, handle, indent=2)
         with (output / "summary.json").open("w", encoding="utf-8") as handle:
             json.dump(summary, handle, indent=2)
         LOGGER.info("Experiment summary written to %s", output / "summary.json")
         return summary
+
+
+def _elapsed_ms(started: float) -> float:
+    return (time.perf_counter() - started) * 1000.0
+
+
+def _cuda_synchronize(enabled: bool) -> None:
+    """Synchronize CUDA only during profiling to isolate asynchronous stage work."""
+    if not enabled:
+        return
+    try:
+        import torch
+    except ImportError:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 def _distribution(values: list[float]) -> dict[str, float | int | None]:

@@ -22,6 +22,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-frame", type=int)
     parser.add_argument("--end-frame", type=int)
     parser.add_argument("--validate-dataset", action="store_true")
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Collect post-warm-up stage timings and write profiling.json",
+    )
+    parser.add_argument(
+        "--profile-warmup-frames",
+        type=int,
+        default=30,
+        help="Frames processed normally but excluded from profiling statistics (default: 30)",
+    )
     return parser
 
 
@@ -83,7 +94,11 @@ def main() -> None:
     if args.validate_dataset:
         validate_dataset(config)
         return
-    summary = TrackingPipeline(config).run()
+    summary = TrackingPipeline(
+        config,
+        profile=args.profile,
+        warmup_frames=args.profile_warmup_frames,
+    ).run()
     print(json.dumps(summary, indent=2))
 
 
